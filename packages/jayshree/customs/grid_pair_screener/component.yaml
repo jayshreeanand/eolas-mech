@@ -1,0 +1,14 @@
+name: grid_pair_screener
+author: jayshree
+version: 0.1.0
+type: custom
+description: Grid Pair Screener
+license: Apache-2.0
+aea_version: ">=1.0.0, <2.0.0"
+fingerprint:
+  __init__.py:
+  grid_pair_screener.py:
+fingerprint_ignore_patterns: []
+entry_point: grid_pair_screener.py
+callable: run
+dependencies: {}
