@@ -116,34 +116,67 @@ class GridPairScreener:
         if self.params.investment_multiplier <= 0:
             raise ValueError("Investment multiplier must be positive")
 
+    def calculate_volatility(self, price_data: List[Dict]) -> float:
+        """Calculate price volatility using standard deviation of returns"""
+        try:
+            # Extract prices as numpy array
+            prices = np.array([float(p['price']) for p in price_data])
+            # Calculate log returns
+            returns = np.diff(np.log(prices))
+            # Calculate annualized volatility
+            return np.std(returns) * np.sqrt(len(returns))
+        except Exception as e:
+            print(f"Error calculating volatility: {e}")
+            return 0.0
+
+    def calculate_trend_strength(self, price_data: List[Dict]) -> float:
+        """Calculate trend strength using price momentum"""
+        try:
+            # Extract prices
+            prices = np.array([float(p['price']) for p in price_data])
+            # Calculate simple moving averages
+            short_ma = np.mean(prices[:24])  # 24-hour MA
+            long_ma = np.mean(prices)        # Full period MA
+            # Calculate trend strength as ratio of MAs
+            return abs(short_ma - long_ma) / long_ma
+        except Exception as e:
+            print(f"Error calculating trend strength: {e}")
+            return 0.0
+
     def parse_price_history(self, values: List[str], timestamps: List[str]) -> List[Dict]:
         """Convert price history arrays into list of price/timestamp dictionaries"""
         try:
-            # Clean the data - remove any trailing dots and split if necessary
-            clean_values = [v.split(',')[0].strip() if ',' in v else v.strip() for v in values]
-            clean_times = [t.split(',')[0].strip() if ',' in t else t.strip() for t in timestamps]
+            # Clean and parse the values
+            clean_values = []
+            clean_times = []
             
+            for value in values:
+                if isinstance(value, str):
+                    parts = value.split(',')
+                    clean_values.extend([float(v.strip()) for v in parts])
+                else:
+                    clean_values.append(float(value))
+            
+            for timestamp in timestamps:
+                if isinstance(timestamp, str):
+                    parts = timestamp.split(',')
+                    clean_times.extend([t.strip() for t in parts])
+                else:
+                    clean_times.append(str(timestamp))
+            
+            # Create price history entries
             return [
                 {
-                    'price': float(price),
+                    'price': price,
                     'timestamp': ts
                 }
                 for price, ts in zip(clean_values, clean_times)
             ]
         except Exception as e:
             print(f"Error parsing price history: {e}")
+            import traceback
+            print(traceback.format_exc())
             return []
-
-    def calculate_volatility(self, price_data: List[Dict]) -> float:
-        """Calculate price volatility using standard deviation of returns"""
-        prices = [float(p['price']) for p in price_data]
-        returns = np.diff(np.log(prices))
-        return np.std(returns) * np.sqrt(len(returns))
-
-    def calculate_trend_strength(self, price_data: List[Dict]) -> float:
-        """Calculate ADX for trend strength"""
-        prices = pd.DataFrame([float(p['price']) for p in price_data])
-        return prices.rolling(window=14).std().iloc[-1]
 
     def suggest_grid_setup(self, pair_analysis: PairAnalysis) -> Dict:
         """Suggest grid setup based on pair analysis"""
@@ -199,7 +232,9 @@ class GridPairScreener:
     def analyze_pair(self, pair_data: Dict) -> Optional[PairAnalysis]:
         """Analyze a trading pair and return analysis if it meets criteria"""
         try:
-            # Parse price history from the arrays
+            print(f"\nAnalyzing {pair_data['pair_name']}...")
+            
+            # Parse price history
             price_history = self.parse_price_history(
                 pair_data['price_history_values'],
                 pair_data['price_history_times']
@@ -209,17 +244,27 @@ class GridPairScreener:
                 print(f"No valid price history for {pair_data['pair_name']}")
                 return None
             
+            print(f"Calculating metrics for {pair_data['pair_name']}...")
+            
+            # Calculate metrics
             volatility = self.calculate_volatility(price_history)
             liquidity = float(pair_data['volume_24h'])
             trend_strength = self.calculate_trend_strength(price_history)
             current_price = float(pair_data['current_price'])
             
+            print(f"Metrics for {pair_data['pair_name']}:")
+            print(f"- Volatility: {volatility:.2%}")
+            print(f"- Liquidity: ${liquidity:,.2f}")
+            print(f"- Trend Strength: {trend_strength:.2f}")
+            
+            # Calculate score
             score = (
                 (volatility / self.params.volatility_threshold) * 0.4 +
                 (liquidity / self.params.liquidity_threshold) * 0.4 +
                 (trend_strength / self.params.trend_strength_threshold) * 0.2
             )
             
+            # Check if pair meets criteria
             if (volatility >= self.params.volatility_threshold and
                 liquidity >= self.params.liquidity_threshold and
                 trend_strength >= self.params.trend_strength_threshold):
@@ -241,11 +286,15 @@ class GridPairScreener:
                     suggested_grid_size=self.params.grid_levels,
                     score=score
                 )
+            else:
+                print(f"{pair_data['pair_name']} did not meet criteria")
             
             return None
             
         except Exception as e:
             print(f"Error analyzing pair {pair_data.get('pair_name', 'unknown')}: {e}")
+            import traceback
+            print(traceback.format_exc())
             return None
 
     def get_screened_pairs(self) -> List[Dict]:
@@ -291,11 +340,11 @@ def main():
         if not all(api_keys.values()):
             raise ValueError("Missing required API keys in environment variables")
         
-        # Set up parameters - adjusted based on the actual data we're seeing
+        # Adjust parameters based on actual market conditions
         params = GridParameters(
-            volatility_threshold=0.01,    # 1% minimum volatility
-            liquidity_threshold=100000,   # $100K daily volume
-            trend_strength_threshold=0.5,  # Adjusted for the current market
+            volatility_threshold=0.005,   # 0.5% minimum volatility
+            liquidity_threshold=50000,    # $50K daily volume
+            trend_strength_threshold=0.01, # 1% trend strength
             min_price_range=0.02,         # 2% minimum range
             max_price_range=0.10,         # 10% maximum range
             grid_levels=10,               # Number of grid levels
@@ -339,6 +388,8 @@ def main():
             
     except Exception as e:
         print(f"Error running screener: {e}")
+        import traceback
+        print(traceback.format_exc())
 
 if __name__ == "__main__":
     main()

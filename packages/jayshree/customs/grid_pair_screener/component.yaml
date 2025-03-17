@@ -2,7 +2,7 @@ name: grid_pair_screener
 author: jayshree
 version: 0.1.0
 type: custom
-description: Grid Pair Screener
+description: Grid Trading Pair Screener
 license: Apache-2.0
 aea_version: ">=1.0.0, <2.0.0"
 fingerprint:
