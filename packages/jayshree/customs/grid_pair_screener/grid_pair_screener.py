@@ -5,6 +5,30 @@ from typing import List, Dict, Optional, Tuple, Any
 from datetime import datetime, timedelta
 from dune_client.client import DuneClient
 from openai import OpenAI
+import os
+from dotenv import load_dotenv
+
+# Configuration
+DUNE_QUERY = """
+SELECT 
+    CONCAT(token_symbol, '/USDT') as pair_name,
+    price as current_price,
+    volume_usd as volume_24h,
+    ARRAY_AGG(
+        json_build_object(
+            'price', price,
+            'timestamp', block_time
+        ) ORDER BY block_time DESC
+        LIMIT 720
+    ) as price_history
+FROM dex.trades
+WHERE block_time >= NOW() - INTERVAL '30 days'
+    AND token_symbol IN ('BTC', 'ETH', 'SOL', 'AVAX', 'MATIC')
+    AND quote_symbol = 'USDT'
+GROUP BY 1, 2, 3
+ORDER BY volume_usd DESC
+LIMIT 10
+"""
 
 @dataclass
 class GridParameters:
@@ -39,10 +63,18 @@ class APIClients:
         self.openai_client = OpenAI(api_key=self.openai_api_key)
         self.dune_client = DuneClient(self.dune_api_key)
 
-    def get_dune_results(self, query_id: int) -> Optional[Dict[str, Any]]:
-        """Fetch the latest results from a Dune query"""
+    def get_dune_results(self, query_text: str) -> Optional[Dict[str, Any]]:
+        """Execute Dune query and fetch results"""
         try:
-            result = self.dune_client.get_latest_result(query_id)
+            # Create and execute query
+            query = self.dune_client.execute(
+                query=query_text,
+                name="Grid Pair Analysis"
+            )
+            
+            # Wait for and fetch results
+            result = self.dune_client.get_result(query)
+            
             return {
                 'result': result.result.rows[:100],
                 'metadata': {
@@ -128,7 +160,7 @@ class GridPairScreener:
             volatility = self.calculate_volatility(pair_data['price_history'])
             liquidity = float(pair_data['volume_24h'])
             trend_strength = self.calculate_trend_strength(pair_data['price_history'])
-            current_price = float(pair_data['price_history'][-1]['price'])
+            current_price = float(pair_data['current_price'])
             
             score = (
                 (volatility / self.params.volatility_threshold) * 0.4 +
@@ -164,10 +196,10 @@ class GridPairScreener:
             print(f"Error analyzing pair: {e}")
             return None
 
-    def get_screened_pairs(self, query_id: int) -> List[Dict]:
+    def get_screened_pairs(self) -> List[Dict]:
         """Screen pairs and return those that meet the criteria with recommendations"""
         try:
-            results = self.clients.get_dune_results(query_id)
+            results = self.clients.get_dune_results(DUNE_QUERY)
             if not results:
                 return []
             
@@ -192,3 +224,69 @@ class GridPairScreener:
         except Exception as e:
             print(f"Error screening pairs: {e}")
             return []
+
+def main():
+    try:
+        # Load environment variables
+        load_dotenv()
+        
+        # Get API keys from environment
+        api_keys = {
+            "dune": os.getenv("DUNE_API_KEY"),
+            "openai": os.getenv("OPENAI_API_KEY")
+        }
+        
+        if not all(api_keys.values()):
+            raise ValueError("Missing required API keys in environment variables")
+        
+        # Set up parameters
+        params = GridParameters(
+            volatility_threshold=0.02,    # 2% minimum volatility
+            liquidity_threshold=1000000,  # $1M daily volume
+            trend_strength_threshold=25,   # ADX threshold
+            min_price_range=0.05,         # 5% minimum range
+            max_price_range=0.20,         # 20% maximum range
+            grid_levels=10,               # Number of grid levels
+            investment_multiplier=0.001    # 0.1% of daily volume
+        )
+        
+        print("Initializing Grid Pair Screener...")
+        clients = APIClients(api_keys)
+        screener = GridPairScreener(clients, params)
+        
+        print("Fetching and analyzing trading pairs...")
+        screened_pairs = screener.get_screened_pairs()
+        
+        if not screened_pairs:
+            print("\nNo pairs found matching the criteria.")
+            return
+        
+        print("\n=== Grid Pair Screener Results ===\n")
+        for idx, pair in enumerate(screened_pairs, 1):
+            print(f"\n{idx}. Pair: {pair['pair']}")
+            print(f"Score: {pair['analysis']['score']:.2f}")
+            
+            print("\nAnalysis:")
+            print(f"- Volatility: {pair['analysis']['volatility']:.2%}")
+            print(f"- Daily Volume: ${pair['analysis']['liquidity']:,.2f}")
+            print(f"- Trend Strength: {pair['analysis']['trend_strength']:.2f}")
+            
+            print("\nGrid Recommendations:")
+            print(f"- Range: ${pair['recommendations']['grid_range'][0]:.2f} - "
+                  f"${pair['recommendations']['grid_range'][1]:.2f}")
+            print(f"- Suggested Investment: ${pair['recommendations']['investment_size']:,.2f}")
+            print(f"- Grid Levels: {pair['recommendations']['grid_size']}")
+            
+            print("\nScenario Analysis:")
+            for scenario, details in pair['recommendations']['scenarios'].items():
+                print(f"\n{scenario.title()}:")
+                print(f"- Potential Profit: {details['potential_profit']:.2f}%")
+                print(f"- Expected Trades: {details['grid_trades']}")
+            
+            print("\n" + "="*50)
+            
+    except Exception as e:
+        print(f"Error running screener: {e}")
+
+if __name__ == "__main__":
+    main()
