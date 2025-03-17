@@ -4,31 +4,13 @@ from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple, Any
 from datetime import datetime, timedelta
 from dune_client.client import DuneClient
+from dune_client.types import QueryParameter
+from dune_client.query import QueryBase
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
 
-# Configuration
-DUNE_QUERY = """
-SELECT 
-    CONCAT(token_symbol, '/USDT') as pair_name,
-    price as current_price,
-    volume_usd as volume_24h,
-    ARRAY_AGG(
-        json_build_object(
-            'price', price,
-            'timestamp', block_time
-        ) ORDER BY block_time DESC
-        LIMIT 720
-    ) as price_history
-FROM dex.trades
-WHERE block_time >= NOW() - INTERVAL '30 days'
-    AND token_symbol IN ('BTC', 'ETH', 'SOL', 'AVAX', 'MATIC')
-    AND quote_symbol = 'USDT'
-GROUP BY 1, 2, 3
-ORDER BY volume_usd DESC
-LIMIT 10
-"""
+DUNE_QUERY_ID = 4861435  # Replace with your actual query ID
 
 @dataclass
 class GridParameters:
@@ -61,37 +43,97 @@ class APIClients:
             raise ValueError("Missing required API keys")
             
         self.openai_client = OpenAI(api_key=self.openai_api_key)
-        self.dune_client = DuneClient(self.dune_api_key)
+        self.dune_client = DuneClient.from_env()
 
-    def get_dune_results(self, query_text: str) -> Optional[Dict[str, Any]]:
-        """Execute Dune query and fetch results"""
+    def get_dune_results(self) -> Optional[Dict[str, Any]]:
+        """Fetch results from Dune query"""
         try:
-            # Create and execute query
-            query = self.dune_client.execute(
-                query=query_text,
-                name="Grid Pair Analysis"
+            print("Creating Dune query...")
+            
+            # Create query object
+            query = QueryBase(
+                name="Grid Pair Analysis",
+                query_id=DUNE_QUERY_ID,
+                params=[]
             )
             
-            # Wait for and fetch results
-            result = self.dune_client.get_result(query)
+            print("Fetching results...")
+            # Get latest results using the correct method signature
+            results = self.dune_client.get_latest_result(DUNE_QUERY_ID)
             
+            if not results or not hasattr(results, 'result') or not results.result.rows:
+                print("No results returned")
+                return None
+
+            print(f"Processing {len(results.result.rows)} rows...")
             return {
-                'result': result.result.rows[:100],
+                'result': results.result.rows[:100],
                 'metadata': {
-                    'total_row_count': len(result.result.rows),
-                    'returned_row_count': min(len(result.result.rows), 100),
-                    'column_names': list(result.result.rows[0].keys()) if result.result.rows else [],
+                    'total_row_count': len(results.result.rows),
+                    'returned_row_count': min(len(results.result.rows), 100),
+                    'column_names': list(results.result.rows[0].keys()) if results.result.rows else [],
                 }
             }
         except Exception as e:
             print(f"Error fetching Dune results: {e}")
+            import traceback
+            print(f"Traceback: {traceback.format_exc()}")
             return None
+
+    def test_connection(self) -> bool:
+        """Test the Dune connection with a simple query"""
+        try:
+            print("Testing Dune connection...")
+            # Use a simple public query
+            result = self.dune_client.get_latest_result(2030910)
+            if result and hasattr(result, 'result'):
+                print("Connection successful!")
+                print(f"Sample data: {result.result.rows[0] if result.result.rows else 'No rows'}")
+                return True
+            return False
+        except Exception as e:
+            print(f"Connection test failed: {e}")
+            return False
 
 class GridPairScreener:
     def __init__(self, clients: APIClients, params: GridParameters):
         self.clients = clients
         self.params = params
+        self.validate_parameters()
         
+    def validate_parameters(self):
+        """Validate screening parameters"""
+        if self.params.volatility_threshold <= 0:
+            raise ValueError("Volatility threshold must be positive")
+        if self.params.liquidity_threshold <= 0:
+            raise ValueError("Liquidity threshold must be positive")
+        if self.params.trend_strength_threshold <= 0:
+            raise ValueError("Trend strength threshold must be positive")
+        if not (0 < self.params.min_price_range <= self.params.max_price_range):
+            raise ValueError("Invalid price range parameters")
+        if self.params.grid_levels < 2:
+            raise ValueError("Must have at least 2 grid levels")
+        if self.params.investment_multiplier <= 0:
+            raise ValueError("Investment multiplier must be positive")
+
+    def parse_price_history(self, values: List[str], timestamps: List[str]) -> List[Dict]:
+        """Convert price history arrays into list of price/timestamp dictionaries"""
+        try:
+            # Clean the data - remove any trailing dots and split if necessary
+            clean_values = [v.split(',')[0].strip() if ',' in v else v.strip() for v in values]
+            clean_times = [t.split(',')[0].strip() if ',' in t else t.strip() for t in timestamps]
+            
+            return [
+                {
+                    'price': float(price),
+                    'timestamp': ts
+                }
+                for price, ts in zip(clean_values, clean_times)
+            ]
+        except Exception as e:
+            print(f"Error parsing price history: {e}")
+            return []
+
     def calculate_volatility(self, price_data: List[Dict]) -> float:
         """Calculate price volatility using standard deviation of returns"""
         prices = [float(p['price']) for p in price_data]
@@ -157,9 +199,19 @@ class GridPairScreener:
     def analyze_pair(self, pair_data: Dict) -> Optional[PairAnalysis]:
         """Analyze a trading pair and return analysis if it meets criteria"""
         try:
-            volatility = self.calculate_volatility(pair_data['price_history'])
+            # Parse price history from the arrays
+            price_history = self.parse_price_history(
+                pair_data['price_history_values'],
+                pair_data['price_history_times']
+            )
+            
+            if not price_history:
+                print(f"No valid price history for {pair_data['pair_name']}")
+                return None
+            
+            volatility = self.calculate_volatility(price_history)
             liquidity = float(pair_data['volume_24h'])
-            trend_strength = self.calculate_trend_strength(pair_data['price_history'])
+            trend_strength = self.calculate_trend_strength(price_history)
             current_price = float(pair_data['current_price'])
             
             score = (
@@ -193,13 +245,13 @@ class GridPairScreener:
             return None
             
         except Exception as e:
-            print(f"Error analyzing pair: {e}")
+            print(f"Error analyzing pair {pair_data.get('pair_name', 'unknown')}: {e}")
             return None
 
     def get_screened_pairs(self) -> List[Dict]:
         """Screen pairs and return those that meet the criteria with recommendations"""
         try:
-            results = self.clients.get_dune_results(DUNE_QUERY)
+            results = self.clients.get_dune_results()
             if not results:
                 return []
             
@@ -239,13 +291,13 @@ def main():
         if not all(api_keys.values()):
             raise ValueError("Missing required API keys in environment variables")
         
-        # Set up parameters
+        # Set up parameters - adjusted based on the actual data we're seeing
         params = GridParameters(
-            volatility_threshold=0.02,    # 2% minimum volatility
-            liquidity_threshold=1000000,  # $1M daily volume
-            trend_strength_threshold=25,   # ADX threshold
-            min_price_range=0.05,         # 5% minimum range
-            max_price_range=0.20,         # 20% maximum range
+            volatility_threshold=0.01,    # 1% minimum volatility
+            liquidity_threshold=100000,   # $100K daily volume
+            trend_strength_threshold=0.5,  # Adjusted for the current market
+            min_price_range=0.02,         # 2% minimum range
+            max_price_range=0.10,         # 10% maximum range
             grid_levels=10,               # Number of grid levels
             investment_multiplier=0.001    # 0.1% of daily volume
         )
